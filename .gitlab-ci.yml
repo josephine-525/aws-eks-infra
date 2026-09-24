@@ -1,0 +1,478 @@
+spec:
+  inputs:
+    confirm_destroy:
+      type: string
+      default: "false"
+      options:
+        - "false"
+        - "true"
+      description: "Destroy safety latch. Set true only when intentionally destroying dev infrastructure."
+    destroy_approval:
+      type: string
+      default: ""
+      options:
+        - ""
+        - "YES_DESTROY_INFRA"
+      description: "Second destroy confirmation. Must be YES_DESTROY_INFRA to show destroy jobs."
+---
+# terraform-live/dev — layered Terraform CI. Manual trigger only (GitLab → CI/CD →
+# Pipelines → "Run pipeline"), same convention as the old expenseinfra/.gitlab-ci.yml.
+#
+# Scope: dev environment only (network/db/security/compute) + the two account-wide
+# layers (ecr, budget-alert). staging/prod are placeholders, never applied, and have
+# no jobs here — see terraform-live/environments/{staging,prod}/ for why they exist
+# at all (directory/state/module-call shape only).
+#
+# Real dependency graph enforced via `needs:` (not just stage order):
+#   network ─┐
+#   db ──────┼─→ security ─→ compute
+#            ┘
+#   ecr, budget-alert: independent, no `needs` on anything.
+# Destroy direction is the reverse: compute → security → (network, db, ecr) in
+# parallel. `budget-alert` has NO destroy job on purpose — it costs nothing to
+# leave running (2 AWS Budgets total in this account, still within the free
+# tier) and is exactly the thing you want still watching spend on the way down.
+# `ecr` DOES get a destroy job, deliberately, even though the design story for
+# a real multi-team company is "account-wide, survives every environment
+# teardown, build once / promote everywhere" — in this actual single-account
+# learning setup, the user is the only consumer and tears the whole account's
+# footprint down between sessions, ECR included. `force_delete = true` on both
+# repos means destroying this permanently deletes every pushed image tag —
+# accepted tradeoff, not an oversight.
+#
+# Required CI/CD variables:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION (masked) — same as
+#     the old expenseinfra pipeline.
+#   TF_MODULES_READ_TOKEN (masked) — GitLab token with read_repository scope across
+#     the demo-org group (terraform-modules is a separate private repo, module
+#     sources are now git::https://... — see the "Switch terraform-modules source
+#     from SSH to HTTPS" commit for why). Reuse the same service-account token
+#     already created for ArgoCD's repo-creds Secrets if convenient — same access
+#     level needed (group-wide, read-only).
+#   EKS_ADMIN_PRINCIPAL_ARN, EKS_CI_PRINCIPAL_ARN (optional) — map to
+#     TF_VAR_eks_admin_principal_arn / TF_VAR_eks_ci_principal_arn for dev/compute.
+#     EKS_CI_PRINCIPAL_ARN in particular must be the IAM principal this CI runs as,
+#     or destroy_apply_compute's kubectl step (see below) won't have cluster access.
+#
+# Destroy-only pipeline: Run pipeline with confirm_destroy=true AND
+# destroy_approval=YES_DESTROY_INFRA — only the destroy_* jobs appear, and only on
+# a protected branch (same double-gate as the old pipeline).
+#
+# destroy_apply_compute automates the real incident hit bringing dev up by hand
+# (2026-09-20, see expenseinfra/README.md's "terraform-live dev environment
+# bring-up log"): deletes the team-payments-ingress ArgoCD Application (so selfHeal
+# doesn't recreate what we're about to delete), deletes the Ingress, and waits for
+# the ALB to actually disappear from AWS — all BEFORE `terraform destroy`, since the
+# ALB is LBC-managed, not in any Terraform state, and destroying the cluster first
+# would orphan it.
+
+stages:
+  - validate
+  - plan-base
+  - apply-base
+  - plan-security
+  - apply-security
+  - plan-compute
+  - apply-compute
+  - destroy-plan-compute
+  - destroy-apply-compute
+  - destroy-plan-security
+  - destroy-apply-security
+  - destroy-plan-base
+  - destroy-apply-base
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+variables:
+  TF_IN_AUTOMATION: "true"
+  CONFIRM_DESTROY: $[[ inputs.confirm_destroy ]]
+  DESTROY_APPROVAL: $[[ inputs.destroy_approval ]]
+
+.terraform_base:
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+
+.terraform_cached:
+  cache:
+    key:
+      files:
+        - $TF_ROOT/.terraform.lock.hcl
+    paths:
+      - $TF_ROOT/.terraform
+
+# netrc auth for git::https:// module sources (terraform-modules is private) +
+# init. One shared step so it's never accidentally dropped by an extends merge
+# (GitLab's `extends` does NOT concatenate before_script across multiple parents —
+# only one wins — so this stays a single template, not split into two).
+.terraform_init:
+  before_script:
+    - |
+      if [ -z "${TF_MODULES_READ_TOKEN:-}" ]; then
+        echo "Set CI/CD variable TF_MODULES_READ_TOKEN (masked, read_repository, group-wide)." >&2
+        exit 1
+      fi
+      cat > ~/.netrc <<NETRC
+      machine gitlab.com
+      login oauth2
+      password ${TF_MODULES_READ_TOKEN}
+      NETRC
+      chmod 600 ~/.netrc
+    - cd "$TF_ROOT"
+    - export TF_VAR_eks_admin_principal_arn="${EKS_ADMIN_PRINCIPAL_ARN:-}"
+    - export TF_VAR_eks_ci_principal_arn="${EKS_CI_PRINCIPAL_ARN:-}"
+    - terraform init -input=false -reconfigure
+
+# Normal plan/apply path only. Destroy-only web runs set both inputs → hidden.
+.terraform_rules: &terraform_rules
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && !($CONFIRM_DESTROY == "true" && $DESTROY_APPROVAL == "YES_DESTROY_INFRA")'
+
+.destroy_rules: &destroy_rules
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true" && $CONFIRM_DESTROY == "true" && $DESTROY_APPROVAL == "YES_DESTROY_INFRA"'
+      when: manual
+    - when: never
+
+# ── validate ────────────────────────────────────────────────────────────────
+
+validate_network:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: validate
+  variables: { TF_ROOT: terraform-live/environments/dev/network }
+  <<: *terraform_rules
+  script: [terraform validate]
+
+validate_db:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: validate
+  variables: { TF_ROOT: terraform-live/environments/dev/db }
+  <<: *terraform_rules
+  script: [terraform validate]
+
+validate_security:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: validate
+  variables: { TF_ROOT: terraform-live/environments/dev/security }
+  <<: *terraform_rules
+  script: [terraform validate]
+
+validate_compute:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: validate
+  variables: { TF_ROOT: terraform-live/environments/dev/compute }
+  <<: *terraform_rules
+  script: [terraform validate]
+
+validate_ecr:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: validate
+  variables: { TF_ROOT: terraform-live/account/ecr }
+  <<: *terraform_rules
+  script: [terraform validate]
+
+validate_budget_alert:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: validate
+  variables: { TF_ROOT: terraform-live/account/budget-alert }
+  <<: *terraform_rules
+  script: [terraform validate]
+
+# ── plan/apply: network, db, ecr, budget-alert (independent of each other) ────
+
+plan_network:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: plan-base
+  needs: ["validate_network"]
+  variables: { TF_ROOT: terraform-live/environments/dev/network }
+  <<: *terraform_rules
+  script:
+    - terraform plan -input=false -no-color -out=plan.cache
+  artifacts:
+    paths: ["$TF_ROOT/plan.cache"]
+
+apply_network:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: apply-base
+  needs: [{ job: plan_network, artifacts: true }]
+  variables: { TF_ROOT: terraform-live/environments/dev/network }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && !($CONFIRM_DESTROY == "true" && $DESTROY_APPROVAL == "YES_DESTROY_INFRA")'
+      when: manual
+    - when: never
+  script:
+    - terraform apply -input=false -auto-approve plan.cache
+
+plan_db:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: plan-base
+  needs: ["validate_db"]
+  variables: { TF_ROOT: terraform-live/environments/dev/db }
+  <<: *terraform_rules
+  script:
+    - terraform plan -input=false -no-color -out=plan.cache
+  artifacts:
+    paths: ["$TF_ROOT/plan.cache"]
+
+apply_db:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: apply-base
+  needs: [{ job: plan_db, artifacts: true }]
+  variables: { TF_ROOT: terraform-live/environments/dev/db }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && !($CONFIRM_DESTROY == "true" && $DESTROY_APPROVAL == "YES_DESTROY_INFRA")'
+      when: manual
+    - when: never
+  script:
+    - terraform apply -input=false -auto-approve plan.cache
+
+plan_ecr:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: plan-base
+  needs: ["validate_ecr"]
+  variables: { TF_ROOT: terraform-live/account/ecr }
+  <<: *terraform_rules
+  script:
+    - terraform plan -input=false -no-color -out=plan.cache
+  artifacts:
+    paths: ["$TF_ROOT/plan.cache"]
+
+apply_ecr:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: apply-base
+  needs: [{ job: plan_ecr, artifacts: true }]
+  variables: { TF_ROOT: terraform-live/account/ecr }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && !($CONFIRM_DESTROY == "true" && $DESTROY_APPROVAL == "YES_DESTROY_INFRA")'
+      when: manual
+    - when: never
+  script:
+    - terraform apply -input=false -auto-approve plan.cache
+
+plan_budget_alert:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: plan-base
+  needs: ["validate_budget_alert"]
+  variables: { TF_ROOT: terraform-live/account/budget-alert }
+  <<: *terraform_rules
+  script:
+    - terraform plan -input=false -no-color -out=plan.cache
+  artifacts:
+    paths: ["$TF_ROOT/plan.cache"]
+
+apply_budget_alert:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: apply-base
+  needs: [{ job: plan_budget_alert, artifacts: true }]
+  variables: { TF_ROOT: terraform-live/account/budget-alert }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && !($CONFIRM_DESTROY == "true" && $DESTROY_APPROVAL == "YES_DESTROY_INFRA")'
+      when: manual
+    - when: never
+  script:
+    - terraform apply -input=false -auto-approve plan.cache
+
+# ── plan/apply: security (needs db's real SSM output, i.e. apply_db) ──────────
+
+plan_security:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: plan-security
+  needs: ["validate_security", "apply_db"]
+  variables: { TF_ROOT: terraform-live/environments/dev/security }
+  <<: *terraform_rules
+  script:
+    - terraform plan -input=false -no-color -out=plan.cache
+  artifacts:
+    paths: ["$TF_ROOT/plan.cache"]
+
+apply_security:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: apply-security
+  needs: [{ job: plan_security, artifacts: true }]
+  variables: { TF_ROOT: terraform-live/environments/dev/security }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && !($CONFIRM_DESTROY == "true" && $DESTROY_APPROVAL == "YES_DESTROY_INFRA")'
+      when: manual
+    - when: never
+  script:
+    - terraform apply -input=false -auto-approve plan.cache
+
+# ── plan/apply: compute (needs network's VPC + security's 4 role/policy ARNs) ─
+
+plan_compute:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: plan-compute
+  needs: ["validate_compute", "apply_network", "apply_security"]
+  variables: { TF_ROOT: terraform-live/environments/dev/compute }
+  <<: *terraform_rules
+  script:
+    - terraform plan -input=false -no-color -out=plan.cache
+  artifacts:
+    paths: ["$TF_ROOT/plan.cache"]
+
+apply_compute:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: apply-compute
+  needs: [{ job: plan_compute, artifacts: true }]
+  variables: { TF_ROOT: terraform-live/environments/dev/compute }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && !($CONFIRM_DESTROY == "true" && $DESTROY_APPROVAL == "YES_DESTROY_INFRA")'
+      when: manual
+    - when: never
+  script:
+    - terraform apply -input=false -auto-approve plan.cache
+    - |
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "Cluster is up. Next steps are NOT this pipeline's job:"
+      echo "  1. expenseapp CI: bootstrap LBC / metrics-server / ArgoCD / monitoring namespace"
+      echo "  2. expenseapp CI: deploy workloads + apply gitops/ Applications"
+      echo "EKS cluster name:"
+      terraform output -no-color eks_cluster_name
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# ── destroy: compute first (with Ingress/ALB pre-cleanup), then security, ────
+# ── then network+db+ecr in parallel. budget-alert is never destroyed here. ───
+
+destroy_plan_compute:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: destroy-plan-compute
+  variables: { TF_ROOT: terraform-live/environments/dev/compute }
+  <<: *destroy_rules
+  script:
+    - terraform plan -destroy -input=false -no-color -out=destroy.cache
+  artifacts:
+    paths: ["$TF_ROOT/destroy.cache"]
+
+# Separate job, alpine:3.20 (NOT hashicorp/terraform:1.9 -- its bundled Alpine base
+# has a broken aws-cli/pyexpat combo: "Error relocating .../pyexpat...so: symbol not
+# found", a known Alpine musl/expat version-mismatch bug, confirmed live 2026-09-21.
+# alpine:3.20 is the exact combo already proven working in expenseapp's own
+# deploy-eks job -- reused here rather than fighting the terraform image's version).
+# terraform itself never needs the external `aws` CLI (its AWS provider uses its own
+# Go SDK), so this cleanup doesn't need to run inside a terraform-capable image at
+# all -- cleanly separable, not just a workaround.
+destroy_precheck_compute:
+  image: alpine:3.20
+  stage: destroy-plan-compute
+  variables:
+    EKS_CLUSTER_NAME: demoapp-dev-expense-eks
+  <<: *destroy_rules
+  script:
+    - apk add --no-cache aws-cli kubectl
+    - |
+      echo "Cleaning up team-payments Ingress/ALB on $EKS_CLUSTER_NAME before destroy (see README's EKS troubleshooting log — destroying the cluster first orphans the LBC-managed ALB)..."
+      aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_DEFAULT_REGION"
+      kubectl delete application team-payments-ingress -n argocd --ignore-not-found=true --timeout=60s || true
+      kubectl delete ingress team-payments -n team-payments --ignore-not-found=true --timeout=60s || true
+      i=0
+      while [ "$i" -lt 30 ]; do
+        ALB=$(aws elbv2 describe-load-balancers --region "$AWS_DEFAULT_REGION" --query "LoadBalancers[?contains(DNSName, 'teampaym')].LoadBalancerArn" --output text 2>/dev/null || true)
+        if [ -z "$ALB" ]; then
+          echo "ALB confirmed gone."
+          break
+        fi
+        echo "Still waiting on ALB deletion: $ALB"
+        i=$((i + 1))
+        sleep 10
+      done
+      if [ -n "${ALB:-}" ]; then
+        echo "ERROR: ALB still present after 5 minutes: $ALB — investigate before continuing (do not patch Ingress finalizers, see README)." >&2
+        exit 1
+      fi
+
+destroy_apply_compute:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: destroy-apply-compute
+  needs: [{ job: destroy_plan_compute, artifacts: true }, "destroy_precheck_compute"]
+  variables: { TF_ROOT: terraform-live/environments/dev/compute }
+  <<: *destroy_rules
+  script:
+    - terraform apply -input=false -auto-approve destroy.cache
+
+destroy_plan_security:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: destroy-plan-security
+  needs: ["destroy_apply_compute"]
+  variables: { TF_ROOT: terraform-live/environments/dev/security }
+  <<: *destroy_rules
+  script:
+    - terraform plan -destroy -input=false -no-color -out=destroy.cache
+  artifacts:
+    paths: ["$TF_ROOT/destroy.cache"]
+
+destroy_apply_security:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: destroy-apply-security
+  needs: [{ job: destroy_plan_security, artifacts: true }]
+  variables: { TF_ROOT: terraform-live/environments/dev/security }
+  <<: *destroy_rules
+  script:
+    - terraform apply -input=false -auto-approve destroy.cache
+
+destroy_plan_network:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: destroy-plan-base
+  needs: ["destroy_apply_security"]
+  variables: { TF_ROOT: terraform-live/environments/dev/network }
+  <<: *destroy_rules
+  script:
+    - terraform plan -destroy -input=false -no-color -out=destroy.cache
+  artifacts:
+    paths: ["$TF_ROOT/destroy.cache"]
+
+destroy_apply_network:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: destroy-apply-base
+  needs: [{ job: destroy_plan_network, artifacts: true }]
+  variables: { TF_ROOT: terraform-live/environments/dev/network }
+  <<: *destroy_rules
+  script:
+    - terraform apply -input=false -auto-approve destroy.cache
+
+destroy_plan_db:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: destroy-plan-base
+  needs: ["destroy_apply_security"]
+  variables: { TF_ROOT: terraform-live/environments/dev/db }
+  <<: *destroy_rules
+  script:
+    - terraform plan -destroy -input=false -no-color -out=destroy.cache
+  artifacts:
+    paths: ["$TF_ROOT/destroy.cache"]
+
+destroy_apply_db:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: destroy-apply-base
+  needs: [{ job: destroy_plan_db, artifacts: true }]
+  variables: { TF_ROOT: terraform-live/environments/dev/db }
+  <<: *destroy_rules
+  script:
+    - terraform apply -input=false -auto-approve destroy.cache
+
+# ecr has no real dependency on network/db/security, but waits for
+# destroy_apply_compute specifically (not just any destroy job) so the cluster
+# is already gone before its images disappear out from under it — nothing to
+# ImagePullBackOff once there are no pods left trying to pull.
+destroy_plan_ecr:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: destroy-plan-base
+  needs: ["destroy_apply_compute"]
+  variables: { TF_ROOT: terraform-live/account/ecr }
+  <<: *destroy_rules
+  script:
+    - terraform plan -destroy -input=false -no-color -out=destroy.cache
+  artifacts:
+    paths: ["$TF_ROOT/destroy.cache"]
+
+destroy_apply_ecr:
+  extends: [.terraform_base, .terraform_cached, .terraform_init]
+  stage: destroy-apply-base
+  needs: [{ job: destroy_plan_ecr, artifacts: true }]
+  variables: { TF_ROOT: terraform-live/account/ecr }
+  <<: *destroy_rules
+  script:
+    - terraform apply -input=false -auto-approve destroy.cache
