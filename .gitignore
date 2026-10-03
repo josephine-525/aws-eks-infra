@@ -1,0 +1,32 @@
+# Terraform
+.terraform/
+terraform/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.plan
+plan.cache
+destroy.cache
+override.tf
+.terraformrc
+terraform.rc
+
+# Manually saved plan/state dumps (e.g. `terraform state pull > pulled-state.json`,
+# `terraform plan -out=tfplan`) — these embed real resource data, never commit them.
+# Was previously tracked by accident; see git history if you need to purge it too.
+terraform/pulled-state.json
+terraform/tfplan
+
+# Commit .terraform.lock.hcl to pin provider versions.
+
+
+
+# Local variable files (copy from terraform.tfvars.example)
+terraform/terraform.tfvars
+terraform/*.auto.tfvars
+terraform/backend.hcl
+terraform/*.backend.hcl
+
+# Lambda zip built from expenseapp/backend (see expense_lambda.tf)
+terraform/lambda/expense_api/bundle.zip

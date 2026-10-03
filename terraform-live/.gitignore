@@ -1,0 +1,12 @@
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Auto-loaded by Terraform on every plan/apply (no -var-file needed), but
+# never committed -- for personal ARNs / anything with this account's ID in
+# it that shouldn't sit in git history (see dev/compute/secrets.auto.tfvars).
+*.auto.tfvars
+*.auto.tfvars.json
